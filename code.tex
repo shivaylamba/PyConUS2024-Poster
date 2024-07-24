@@ -1,0 +1,61 @@
+\begin{document}
+\begin{minted}[fontsize=\small]{python3}
+import transformers
+from dataset import Dataset
+from transformers import Trainer, TrainingArguments
+from flytekit import task, workflow
+
+def train(
+    config: TrainerConfig, dataset: Dataset, 
+    deepspeed_config: Optional[dict] = None
+    ) -> flytekit.directory.FlyteDirectory:  
+  train_dataset, eval_dataset = split_data(dataset)
+  model = transformers.AutoModelForCausalLM.from_pretrained(config.base_model)  
+  tokenizer = transformers.AutoTokenizer.from_pretrained(config.base_model, **tokenizer_kwargs)
+  training_args = TrainingArguments ( learning_rate=config.learning_rate, fp16=config.fp16, ...)
+  trainer = Trainer(
+      model=model, tokenizer=tokenizer, args=training_args, train_dataset=train_dataset,
+      eval_dataset=eval_dataset,)
+  trainer.train()
+  trainer.save_model(output_dir=config.output_dir)
+  return flytekit.directory.FlyteDirectory(path=output_dir)
+
+def get_data(config: TrainerConfig) -> Annotated[StructuredDataset, PARQUET]:
+  dataset = load_dataset(config.data_path, config.data_name,)
+  pd_dataset = dataset["train"].to_pandas()
+  try:
+    WikipediaDataset.validate(pd_dataset, lazy=True)
+  except pa.errors.SchemaErrors as exc:
+    flytekit.Deck("pandera-errors", TopFrameRenderer(max_rows=100).to_html(exc.failure_cases))
+  flytekit.Deck("dataset", HuggingFaceDatasetRenderer().to_html(dataset["train"]))
+  return StructuredDataset(dataframe=dataset["train"])
+
+def fine_tune(config: TrainerConfig,
+    deepspeed_config: Optional[dict] = None,) -> str:
+    data = get_data(config.config)
+    model_dir = train(config=config, dataset=data, deepspeed_config=deepspeed_config,)
+    quantized_model_dir = quantize_model(config.config, model_dir=model_dir)
+    save_to_hf_hub(model_dir=model_dir, config=config)
+    save_to_hf_hub(model_dir=quantized_model_dir, config=config, quantized_8bit=True)
+    return model_dir
+    
+@task(requests=Resources(mem="8Gi", cpu="2", ephemeral_storage="8Gi"),
+    disable_deck=False, cache=True, cache_version="0.0.0",)
+    
+def get_data(config: TrainerConfig) -> Annotated[StructuredDataset, PARQUET]:
+    ...
+@task(retries=3, cache=True, cache_version="0.0.0", 
+requests=Resources(mem="256Gi", cpu="64", gpu="8", ephemeral_storage="200Gi"),
+    task_config=Elastic(
+        nnodes=5, nproc_per_node=8,
+        rdzv_configs={"timeout": 3600, "join_timeout": 3600},
+        max_restarts=1,),)
+        
+def train(config: TrainerConfig, dataset: Dataset, deepspeed_config: Optional[dict] = None) ->
+flytekit.directory.FlyteDirectory:
+    ...
+@workflow
+def fine_tune(config: TrainerConfig, deepspeed_config: Optional[dict] = None):
+    ...
+\end{minted}
+\end{document}
